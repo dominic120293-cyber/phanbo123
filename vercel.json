@@ -1,0 +1,21 @@
+{
+  "functions": {
+    "api/index.py": {
+      "runtime": "python3.9",
+      "memory": 1024,
+      "maxDuration": 60
+    }
+  },
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "api/index.py"
+    }
+  ],
+  "builds": [
+    {
+      "src": "api/index.py",
+      "use": "@vercel/python"
+    }
+  ]
+}
