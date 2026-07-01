@@ -43,10 +43,15 @@ def _log(msg: str):
 # ============================================================
 # TUNING FLAGS
 # ============================================================
-FAST_MODE         = False   # True = bỏ block_bay_wc khỏi MIP (khuyến nghị)
+FAST_MODE         = True   # True = bỏ block_bay_wc khỏi MIP (khuyến nghị)
 SOLVER_TIME_LIMIT = 60    # giây – 0 clashes thường tìm thấy trước 40s
 MAX_YBS_PER_ASSIGN    = 2 # Tối đa YB mở cho 1 lần gán (2=chặt, 3=vừa, 4=lỏng)
 ALT_BLOCK_ON_EVICTION = True
+MAX_CONT_PER_BLOCK_BAY = 50
+                          # Số container tối đa 1 block được phép cấp cho
+                          # 1 vessel bay (tính tổng mọi giờ + mọi WC).
+                          # Ràng buộc được áp cả vào MIP lẫn pick_n.
+                          # Đặt None hoặc 0 để tắt giới hạn này.
                           # True  = khi block gốc bị evict, deferred thử block
                           #         khác cùng ST/POD trước → cont lẻ sang A03/B01
                           # False = hành vi cũ: luôn retry cùng block gốc
@@ -171,6 +176,43 @@ def run_optimization(file_input):
     blocks         = sorted(blocks_set)
     supply_keys    = [k for k in supply if any(supply[k][w] > 0 for w in weight_classes)]
     _log(f"Supply format: {'BLOCK+ST+POD' if has_st_pod_supply else 'BLOCK only'}")
+
+    # ── Map (MOVE HOUR, BAY số) → VESSEL BAY ─────────────────────────
+    # Cột J (index 9)  = VESSEL BAY, ví dụ "34A", "34B", "02A"
+    # Cột O (index 14) = MOVE HOUR,  ví dụ "+SA0200"
+    # Cột P (index 15) = BAY,        ví dụ "34", "02"  (text số thuần)
+    #
+    # Matching rule: BAY cột P ("34") khớp với phần số của VESSEL BAY cột J
+    # ("34A" → "34", "34B" → "34") → lấy đúng vessel bay theo từng bay.
+    # Key lookup: (move_hour_str, bay_numeric_str) → vessel_bay_str
+
+    def _bay_num(val: str) -> str:
+        """Trích phần số liên tiếp đầu tiên trong chuỗi bay.
+        'BAY 34' → '34', '34A' → '34', '02B' → '02', '34' → '34'."""
+        import re
+        m = re.search(r'\d+', str(val).strip())
+        return m.group() if m else ''
+
+    move_hour_vessel_bay: dict = {}   # key: (mh_str, bay_num_str) → vb_str
+    try:
+        df_raw = pd.read_excel(xls, sheet_name='DATA', header=None)
+        COL_VESSEL_BAY = 9   # J
+        COL_MOVE_HOUR  = 14  # O
+        COL_BAY        = 15  # P
+        if df_raw.shape[1] > max(COL_VESSEL_BAY, COL_MOVE_HOUR, COL_BAY):
+            for _, row in df_raw.iterrows():
+                mh  = row.iloc[COL_MOVE_HOUR]
+                vb  = row.iloc[COL_VESSEL_BAY]
+                bay = row.iloc[COL_BAY]
+                if pd.notna(mh) and pd.notna(vb) and pd.notna(bay):
+                    mh_str  = str(mh).strip()
+                    vb_str  = str(vb).strip()
+                    bay_num = _bay_num(str(bay))
+                    if mh_str and vb_str and bay_num:
+                        move_hour_vessel_bay[(mh_str, bay_num)] = vb_str
+        _log(f"VESSEL BAY map: {len(move_hour_vessel_bay)} entries.")
+    except Exception as e:
+        _log(f"Không build được VESSEL BAY map: {e}")
 
     # Sheet DATA
     container_data_available = False
@@ -305,7 +347,7 @@ def run_optimization(file_input):
 
     prob = pulp.LpProblem("Minimize_Clashes", pulp.LpMinimize)
 
-    CLASH_W = 20.0; SINGLE_W = 50.0; SPREAD_W = 10.0; BAY_SINGLE_W = 50.0
+    CLASH_W = 70.0; SINGLE_W = 50.0; SPREAD_W = 50.0; BAY_SINGLE_W = 50.0
 
     # ── [WIN 2+4] Xóa u_vars, viết e trực tiếp + tight upper bound ──
     e_vars = {}
@@ -416,6 +458,16 @@ def run_optimization(file_input):
                 if key in x_vars:
                     prob += x_vars[key] <= d * y_vars[(h, s, bay, b)]
 
+    # ── MAX_CONT_PER_BLOCK_BAY constraint ──────────────────────────────
+    # Tổng container block b cấp cho vessel bay (mọi giờ, mọi WC) <= giới hạn
+    if MAX_CONT_PER_BLOCK_BAY:
+        x_by_block_bay = defaultdict(list)
+        for (h, s, bay, b, dkey), xvar in x_vars.items():
+            x_by_block_bay[(b, bay)].append(xvar)
+        for (b, bay), xlist in x_by_block_bay.items():
+            prob += (pulp.lpSum(xlist) <= MAX_CONT_PER_BLOCK_BAY,
+                     f"cap_bb_{b}_{bay}")
+
     t_build = len(prob.variables()); nc = len(prob.constraints)
     _log(f"Model: {t_build} biến, {nc} constraints")
 
@@ -505,6 +557,8 @@ def run_optimization(file_input):
                     avail[(blk, c['wc'], c['st'], c['pod'])].append(c)
 
         opened_ybs = set()
+        # Tracker: số cont đã pick theo (block, vessel_bay) – enforce MAX_CONT_PER_BLOCK_BAY
+        block_bay_picked: dict = defaultdict(int)
 
         def pick_n(block, wc, st_match, pod_match, qty,
                    h, s_job, bay_job, h_rank_val, result_list):
@@ -528,6 +582,15 @@ def run_optimization(file_input):
             remaining = qty
             akey = (block, wc, st_match, pod_match)
             av   = avail[akey]
+
+            # Tính quota còn lại cho (block, vessel_bay) này
+            if MAX_CONT_PER_BLOCK_BAY:
+                already = block_bay_picked[(block, bay_job)]
+                quota   = MAX_CONT_PER_BLOCK_BAY - already
+                if quota <= 0:
+                    # Block này đã đủ quota cho vessel bay → trả toàn bộ về deferred
+                    return remaining
+                remaining = min(remaining, quota)
 
             # local_opened: YBs mở trong lần này; newly_opened: YBs do lần này mở mới
             local_opened:  set  = set()
@@ -601,6 +664,8 @@ def run_optimization(file_input):
                     'MOVE HOUR': h, 'CONTAINER ID': best['real_cont_id'],
                     'ST': best['st'], 'POD': best['pod'],
                     'STS': s_job, 'BAY': bay_job,
+                    'VESSEL BAY': move_hour_vessel_bay.get(
+                        (str(h).strip(), _bay_num(str(bay_job))), ''),
                     'ASSIGNED BLOCK': block, 'WEIGHT CLASS': wc,
                     'QUANTITIES': qty,
                     'YB': best['yb'], 'YR': best['yr'], 'YT': best['yt'],
@@ -658,7 +723,13 @@ def run_optimization(file_input):
             for _, entry in my_picks:
                 result_list.append(entry)
 
-            return remaining
+            # Cập nhật tracker block_bay_picked
+            if MAX_CONT_PER_BLOCK_BAY:
+                block_bay_picked[(block, bay_job)] += len(my_picks)
+
+            # Tính lại remaining thực tế (qty gốc - số đã pick thành công)
+            actual_picked = len(my_picks)
+            return qty - actual_picked
 
         # [WIN 7] sort once, iterate with hour filter
         df_rs = df_result.copy()
@@ -710,6 +781,8 @@ def run_optimization(file_input):
                 if b not in pool:
                     df_result_detail.append({
                         'MOVE HOUR': h, 'STS': s, 'BAY': bay_job,
+                        'VESSEL BAY': move_hour_vessel_bay.get(
+                            (str(h).strip(), _bay_num(str(bay_job))), ''),
                         'ASSIGNED BLOCK': b, 'WEIGHT CLASS': w,
                         'CONTAINER ID': '', 'ST': '', 'POD': '',
                         'QUANTITIES': qty,
@@ -857,26 +930,31 @@ def run_optimization(file_input):
 
     # Result column config
     core_cols     = ['MOVE HOUR', 'CONT LIST', 'CONTAINER ID', 'ST', 'POD',
-                     'STS', 'BAY', 'ASSIGNED BLOCK', 'WEIGHT CLASS', 'QUANTITIES']
+                     'STS', 'VESSEL BAY', 'BAY', 'ASSIGNED BLOCK',
+                     'WEIGHT CLASS', 'QUANTITIES']
     position_cols = ['YB', 'YR', 'YT', 'YARD POSITION']
     all_result_cols = (core_cols + position_cols) if container_data_available else \
-                      ['MOVE HOUR', 'STS', 'BAY', 'ASSIGNED BLOCK',
-                       'WEIGHT CLASS', 'QUANTITIES']
+                      ['MOVE HOUR', 'STS', 'VESSEL BAY', 'BAY',
+                       'ASSIGNED BLOCK', 'WEIGHT CLASS', 'QUANTITIES']
     col_widths_map = {
         'MOVE HOUR': 14, 'CONT LIST': 45, 'CONTAINER ID': 20,
-        'ST': 10, 'POD': 10, 'STS': 10, 'BAY': 10,
+        'ST': 10, 'POD': 10, 'STS': 10,
+        'VESSEL BAY': 12,
+        'BAY': 10,
         'ASSIGNED BLOCK': 16, 'WEIGHT CLASS': 14, 'QUANTITIES': 12,
         'YB': 8, 'YR': 8, 'YT': 8, 'YARD POSITION': 18
     }
     CONT_LIST_SET = {'CONT LIST'}
     CONT_ID_SET   = {'CONTAINER ID', 'ST', 'POD'}
+    VESSEL_BAY_SET = {'VESSEL BAY'}
     POS_SET       = set(position_cols)
     INT_COLS      = {'YB', 'YR', 'YT'}
 
     def _hdr_key(cn):
-        if cn in CONT_LIST_SET: return 'hdr_pale'
-        if cn in CONT_ID_SET:   return 'hdr_mid'
-        if cn in POS_SET:       return 'hdr_light'
+        if cn in CONT_LIST_SET:   return 'hdr_pale'
+        if cn in CONT_ID_SET:     return 'hdr_mid'
+        if cn in VESSEL_BAY_SET:  return 'hdr_mid'
+        if cn in POS_SET:         return 'hdr_light'
         return 'hdr_dark'
 
     _dummy = wb.create_sheet('_dummy_styles')
